@@ -193,3 +193,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# 本地下载的 CUDA keyring 安装包
+/cuda-keyring_1.1-1_all.deb
+/cuda-keyring_1.1-1_all.deb.1
