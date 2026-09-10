@@ -1,10 +1,12 @@
 import torch
 from torch import nn
 
+from nanovllm.utils.compilation import compile_on_supported_gpu
+
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    @compile_on_supported_gpu
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

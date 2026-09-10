@@ -2,6 +2,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from nanovllm.utils.compilation import compile_on_supported_gpu
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -34,7 +36,7 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @compile_on_supported_gpu
     def forward(
         self,
         positions: torch.Tensor,

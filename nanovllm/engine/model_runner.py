@@ -1,4 +1,5 @@
 import pickle
+import warnings
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -8,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.attention import can_use_flash_attention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -26,6 +28,13 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
+        legacy_gpu = torch.cuda.get_device_capability(rank)[0] < 8
+        if legacy_gpu and hf_config.dtype != torch.float32:
+            warnings.warn("Using float32 on pre-Ampere GPU for compatibility.")
+            hf_config.dtype = torch.float32
+        if not can_use_flash_attention(torch.device("cuda", rank), hf_config.dtype):
+            warnings.warn("Using PyTorch math attention; CUDA graphs are disabled.")
+            self.enforce_eager = True
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
@@ -211,6 +220,7 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
