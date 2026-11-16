@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models import check_model_contract, resolve_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.layers.attention import can_use_flash_attention
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -19,6 +19,8 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
+        self.model_cls = resolve_model_class(hf_config)
+        check_model_contract(self.model_cls)
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
@@ -37,7 +39,7 @@ class ModelRunner:
             self.enforce_eager = True
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = self.model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -122,12 +124,23 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        num_layers = hf_config.num_hidden_layers
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                if layer_id >= num_layers:
+                    raise ValueError(
+                        f"模型里带 KV cache 的模块比 config 声明的 {num_layers} 层多，"
+                        f"第 {layer_id + 1} 个模块没有对应的 cache 可挂"
+                    )
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        if layer_id != num_layers:
+            raise ValueError(
+                f"模型里只有 {layer_id} 个模块带 KV cache，但 config 声明 {num_layers} 层；"
+                f"少掉的层会读写未分配的 cache"
+            )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
