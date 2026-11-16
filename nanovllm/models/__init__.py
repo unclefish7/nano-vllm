@@ -7,6 +7,7 @@
 """
 
 import inspect
+import os
 
 from torch import nn
 
@@ -16,6 +17,36 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 ARCH: dict[str, type[nn.Module]] = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
 }
+
+
+def register_candidate_file(path: str) -> str:
+    """把候选 .py 文件里定义的 *ForCausalLM 类登记进 ARCH，返回架构名。
+
+    引擎用 spawn 起其他 rank，子进程会重新 import 本模块。只在父进程里改
+    ARCH 是传不过去的，所以这里提供一个“从文件重放登记”的入口，
+    由环境变量 NANOVLLM_MODEL_FILE 在子进程导入时自动触发。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("nanovllm_candidate_plugin", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"无法把 {path} 当成 Python 模块加载")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for attr, obj in vars(module).items():
+        if (
+            inspect.isclass(obj)
+            and attr.endswith("ForCausalLM")
+            and obj.__module__ == module.__name__
+        ):
+            ARCH[attr] = obj
+            return attr
+    raise ValueError(f"{path} 里没有定义 *ForCausalLM 类")
+
+
+_candidate_file = os.environ.get("NANOVLLM_MODEL_FILE")
+if _candidate_file:
+    register_candidate_file(_candidate_file)
 
 
 def resolve_model_class(hf_config) -> type[nn.Module]:
