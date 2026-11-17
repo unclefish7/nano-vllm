@@ -1,5 +1,6 @@
 import pickle
 import warnings
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -27,7 +28,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl",
+            f"tcp://127.0.0.1:{config.master_port}",
+            world_size=self.world_size,
+            rank=rank,
+            timeout=timedelta(seconds=120),
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         legacy_gpu = torch.cuda.get_device_capability(rank)[0] < 8
@@ -185,10 +192,12 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q_list, cu_seqlens_k_list = cu_seqlens_q, cu_seqlens_k
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    cu_seqlens_q_list=cu_seqlens_q_list, cu_seqlens_k_list=cu_seqlens_k_list)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -204,9 +213,11 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_list = context_lens
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    context_lens_list=context_lens_list)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

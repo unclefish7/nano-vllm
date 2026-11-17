@@ -1,4 +1,5 @@
 import atexit
+import socket
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -12,6 +13,12 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -19,6 +26,12 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
+        if not config.master_port:
+            config.master_port = free_port()
+        # 先用父进程验一遍模型类：子进程若在入组前就崩掉，父进程会在
+        # init_process_group 里空等到超时，错误信息也看不到。
+        from nanovllm.models import check_model_contract, resolve_model_class
+        check_model_contract(resolve_model_class(config.hf_config))
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")

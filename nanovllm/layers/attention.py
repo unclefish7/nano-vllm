@@ -100,11 +100,16 @@ class Attention(nn.Module):
         # Eager only: lengths/block tables are read on the host per batch.
         context = get_context()
         if context.is_prefill:
-            q_offsets = context.cu_seqlens_q.tolist()
-            k_offsets = context.cu_seqlens_k.tolist()
+            q_offsets = context.cu_seqlens_q_list
+            k_offsets = context.cu_seqlens_k_list
+            if q_offsets is None or k_offsets is None:    # 没有主机侧副本才退回同步取
+                q_offsets = context.cu_seqlens_q.tolist()
+                k_offsets = context.cu_seqlens_k.tolist()
             lengths = [b - a for a, b in zip(k_offsets, k_offsets[1:])]
         else:
-            lengths = context.context_lens.tolist()
+            lengths = context.context_lens_list
+            if lengths is None:
+                lengths = context.context_lens.tolist()
             q_offsets = list(range(len(lengths) + 1))
         outputs = []
         for i, length in enumerate(lengths):

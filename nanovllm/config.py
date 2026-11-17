@@ -16,6 +16,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    master_port: int = 0  # 0 = 由引擎自动挑一个空闲端口
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
