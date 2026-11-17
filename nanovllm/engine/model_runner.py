@@ -28,6 +28,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        torch.cuda.set_device(rank)
         dist.init_process_group(
             "nccl",
             f"tcp://127.0.0.1:{config.master_port}",
@@ -35,7 +36,6 @@ class ModelRunner:
             rank=rank,
             timeout=timedelta(seconds=120),
         )
-        torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         legacy_gpu = torch.cuda.get_device_capability(rank)[0] < 8
         if legacy_gpu and hf_config.dtype != torch.float32:
