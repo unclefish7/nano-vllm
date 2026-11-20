@@ -32,6 +32,8 @@ class LLMEngine:
         # init_process_group 里空等到超时，错误信息也看不到。
         from nanovllm.models import check_model_contract, resolve_model_class
         check_model_contract(resolve_model_class(config.hf_config))
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        config.resolve_eos(self.tokenizer.eos_token_id)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -42,8 +44,6 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 

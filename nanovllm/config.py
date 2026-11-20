@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from transformers import AutoConfig
+from transformers import AutoConfig, GenerationConfig
 
 
 @dataclass(slots=True)
@@ -13,7 +13,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
-    eos: int = -1
+    eos: int | list[int] | None = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     master_port: int = 0  # 0 = 由引擎自动挑一个空闲端口
@@ -24,3 +24,11 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+
+    def resolve_eos(self, tokenizer_eos: int | None) -> None:
+        eos = getattr(self.hf_config, "eos_token_id", None)
+        if os.path.isfile(os.path.join(self.model, "generation_config.json")):
+            generation = GenerationConfig.from_pretrained(self.model, local_files_only=True)
+            if generation.eos_token_id is not None:
+                eos = generation.eos_token_id
+        self.eos = tokenizer_eos if eos is None else eos
