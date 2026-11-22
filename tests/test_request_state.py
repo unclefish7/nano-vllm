@@ -124,6 +124,14 @@ class RequestStateTest(unittest.TestCase):
         self.assertEqual(read_request_state(layers[1], "window").tolist(), [[0, 0], [0, 0]])
         self.assertEqual(read_request_state(layers[0], "count").dtype, torch.int64)
 
+    def test_single_kv_page_stays_available_for_requests(self):
+        self.capacity = 48  # 只够一页时仍可进行 eager 推理。
+        with self.assertWarnsRegex(UserWarning, "eager"):
+            r = self.runner(Attention(1, 3, 1, 1), eager=False)
+        self.assertTrue(r.enforce_eager)
+        self.assertEqual(r.config.num_kvcache_blocks, 1)
+        self.assertEqual(r.kv_cache.size(2), 1)
+
     def test_budget_rejects_fixed_states_or_insufficient_kv_space(self):
         self.capacity = 30
         with self.assertRaisesRegex(ValueError, "状态"):
@@ -242,8 +250,16 @@ class RequestStateTest(unittest.TestCase):
         self.enter_patch(torch.cuda, "graph", side_effect=lambda *args: nullcontext())
         self.enter_patch(torch.cuda, "synchronize")
         seen = []
-        hook = r.model.register_forward_pre_hook(
-            lambda m, args: seen.append((get_context(), *args)))
+        def check_window_position(module, args):
+            ctx = get_context()
+            if not ctx.is_prefill:
+                # 窗口通过 context_lens - 1 选取当前位置，负索引会直接报错。
+                positions = torch.arange(r.config.max_model_len)
+                selected = positions.index_select(0, ctx.context_lens.long() - 1)
+                torch.testing.assert_close(selected, args[1])
+                seen.append((ctx, *args))
+
+        hook = r.model.register_forward_pre_hook(check_window_position)
         self.addCleanup(hook.remove)
         from nanovllm.layers.request_state import read_request_state
         capture_counts = []
@@ -274,3 +290,58 @@ class RequestStateTest(unittest.TestCase):
             expected = [[i + 10, i + 1, 2] if i != 0 or order[0] == 4
                         else [1, 1, 3] for i in order]
             self.assertEqual(actual.tolist(), expected)
+
+    def test_padded_decode_attention_reads_an_isolated_zero_page(self):
+        class DecodeAttention(Attention):
+            def forward(self, tokens, positions):
+                values = tokens.float()[:, None, None].repeat(1, 1, 3)
+                zeros = torch.zeros_like(values)
+                return super().forward(zeros, zeros, values).reshape(-1, 3)
+
+            def compute_logits(self, hidden):
+                return hidden
+
+        self.enter_patch(torch.cuda, "CUDAGraph")
+        self.enter_patch(torch.cuda, "graph", side_effect=lambda *args: nullcontext())
+        self.enter_patch(torch.cuda, "synchronize")
+        r = self.runner(DecodeAttention(1, 3, 1, 1), slots=4, eager=False)
+        live_pages = r.kv_cache[:, :, :r.config.num_kvcache_blocks]
+        live_pages.fill_(3)
+        captured = {}
+
+        def check_capture(module, args, output):
+            ctx = get_context()
+            bs = len(args[0])
+            self.assertEqual(ctx.context_lens.tolist(), [1] * bs)
+            self.assertEqual(ctx.slot_mapping.tolist(), [-1] * bs)
+            self.assertTrue((ctx.block_tables[:, 0] >= r.config.num_kvcache_blocks).all())
+            torch.testing.assert_close(output, torch.zeros_like(output))
+            captured[bs] = (ctx, *args)
+
+        with r.model.register_forward_hook(check_capture):
+            r.capture_cudagraph()
+        self.assertTrue((live_pages == 3).all())
+        ctx, ids, positions = captured[4]
+
+        def replay():
+            from nanovllm.utils import context
+            with patch.object(context, "_CONTEXT", ctx):
+                r.graph_vars["outputs"][:4].copy_(r.model(ids, positions))
+
+        r.graphs[4].replay.side_effect = replay
+        with patch.object(Sequence, "block_size", 2):
+            seqs = [Sequence([3, 11 + i]) for i in range(4)]
+            for i, seq in enumerate(seqs):
+                seq.block_table = [i]
+            # 先把第 4 行指向真实页，再把它作为填充行重放同一张图。
+            r.run_model(*r.prepare_decode(seqs), False)
+            before = r.kv_cache.clone()
+            actual = r.run_model(*r.prepare_decode(seqs[:3]), False)
+        self.assertEqual(ctx.context_lens.tolist(), [2, 2, 2, 1])
+        self.assertEqual(ctx.slot_mapping.tolist(), [1, 3, 5, -1])
+        self.assertEqual(positions.tolist(), [1, 1, 1, 0])
+        self.assertEqual(ids[-1].item(), 0)
+        self.assertGreaterEqual(ctx.block_tables[-1, 0].item(), r.config.num_kvcache_blocks)
+        torch.testing.assert_close(r.graph_vars["outputs"][3], torch.zeros(3))
+        torch.testing.assert_close(actual[:, 0], torch.tensor([7., 7.5, 8.]))
+        torch.testing.assert_close(r.kv_cache, before)

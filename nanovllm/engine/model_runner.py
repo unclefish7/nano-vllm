@@ -167,9 +167,15 @@ class ModelRunner:
             num_blocks = capacity.item()
         if num_blocks < 1:
             raise ValueError(f"单个 KV 块需要 {block_bytes} 字节，显存预算只剩 {budget} 字节")
-        config.num_kvcache_blocks = num_blocks
+        if num_blocks == 1 and not self.enforce_eager:
+            warnings.warn("显存仅容纳一个 KV 块，使用 eager 推理以保留请求页。")
+            self.enforce_eager = True
+        # 图的虚拟 decode 行共享末尾的只读零页。调度器只分配前面的请求页。
+        config.num_kvcache_blocks = num_blocks if self.enforce_eager else num_blocks - 1
         self.kv_cache = torch.empty(2, len(kv_modules), num_blocks, self.block_size,
                                     num_kv_heads, head_dim, dtype=hf_config.dtype)
+        if not self.enforce_eager:
+            self.kv_cache[:, :, config.num_kvcache_blocks].zero_()
         for idx, module in enumerate(kv_modules):
             module.k_cache = self.kv_cache[0, idx]
             module.v_cache = self.kv_cache[1, idx]
@@ -284,16 +290,18 @@ class ModelRunner:
                 graph_vars["slot_mapping"][:bs] = context.slot_mapping
                 graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if context.request_slots is not None:
-                slots = graph_vars["request_slots"]
-                slots[:bs] = context.request_slots
-                pad = graph_bs - bs
-                if pad:
-                    padding_slots = graph_vars["padding_slots"][:pad]
+                graph_vars["request_slots"][:bs] = context.request_slots
+            if bs < graph_bs:
+                padding = slice(bs, graph_bs)
+                graph_vars["positions"][padding].zero_()
+                graph_vars["input_ids"][padding].zero_()
+                graph_vars["context_lens"][padding].fill_(1)
+                if context.block_tables is not None:
+                    graph_vars["block_tables"][padding].fill_(self.config.num_kvcache_blocks)
+                if context.request_slots is not None:
+                    padding_slots = graph_vars["padding_slots"][:graph_bs - bs]
                     self.request_states.reset(padding_slots)
-                    slots[bs:graph_bs] = padding_slots
-                    graph_vars["positions"][bs:graph_bs].zero_()
-                    graph_vars["input_ids"][bs:graph_bs].zero_()
-            graph_vars["context_lens"].zero_()
+                    graph_vars["request_slots"][padding] = padding_slots
             graph_vars["context_lens"][:bs] = context.context_lens
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -316,8 +324,8 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        context_lens = torch.ones(max_bs, dtype=torch.int32)
+        block_tables = torch.full((max_bs, max_num_blocks), config.num_kvcache_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         request_slots = padding_slots = None
         if self.request_states.nbytes:
