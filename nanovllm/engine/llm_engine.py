@@ -22,7 +22,7 @@ def free_port() -> int:
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
+        config_fields = {field.name for field in fields(Config) if field.init}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size

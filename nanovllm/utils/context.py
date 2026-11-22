@@ -18,6 +18,7 @@ class Context:
     cu_seqlens_q_list: list[int] | None = None
     cu_seqlens_k_list: list[int] | None = None
     context_lens_list: list[int] | None = None
+    request_slots: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -26,12 +27,12 @@ def get_context():
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0,
                 slot_mapping=None, context_lens=None, block_tables=None, *,
-                cu_seqlens_q_list=None, cu_seqlens_k_list=None, context_lens_list=None):
+                cu_seqlens_q_list=None, cu_seqlens_k_list=None, context_lens_list=None, request_slots=None):
     global _CONTEXT
     _CONTEXT = Context(
         is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         slot_mapping, context_lens, block_tables,
-        cu_seqlens_q_list, cu_seqlens_k_list, context_lens_list,
+        cu_seqlens_q_list, cu_seqlens_k_list, context_lens_list, request_slots,
     )
 
 def reset_context():

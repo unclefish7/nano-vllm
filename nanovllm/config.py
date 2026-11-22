@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig, GenerationConfig
 
 
@@ -17,6 +17,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     master_port: int = 0  # 0 = 由引擎自动挑一个空闲端口
+    prefix_cache_disabled_reason: str | None = field(default=None, init=False)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
