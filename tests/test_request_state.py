@@ -86,7 +86,7 @@ class RequestStateTest(unittest.TestCase):
         self.addCleanup(p.stop)
         return p.start()
 
-    def runner(self, model, slots=2, chunk=2, eager=True):
+    def runner(self, model, slots=2, chunk=2, eager=True, hf_config=None):
         r = ModelRunner.__new__(ModelRunner)
         r.rank = 0
         r.world_size = 1
@@ -94,8 +94,8 @@ class RequestStateTest(unittest.TestCase):
         r.enforce_eager = eager
         r.model = model
         r.config = SimpleNamespace(
-            hf_config=SimpleNamespace(dtype=torch.float32, num_hidden_layers=16,
-                                      hidden_size=3, num_attention_heads=1, num_key_value_heads=1),
+            hf_config=hf_config or SimpleNamespace(dtype=torch.float32, num_hidden_layers=16,
+                                                   hidden_size=3, num_attention_heads=1, num_key_value_heads=1),
             max_num_seqs=slots, max_num_batched_tokens=chunk, max_model_len=12,
             eos=-1, gpu_memory_utilization=1.0, kvcache_block_size=r.block_size,
         )
@@ -105,6 +105,62 @@ class RequestStateTest(unittest.TestCase):
         self.used += r.request_states.nbytes
         r.allocate_kv_cache()
         return r
+
+    @patch.object(Sequence, "block_size", 2)
+    def test_padded_values_match_unpadded_attention_across_kv_pages(self):
+        # 配置推导头宽为 16，实际展开的每个 KV 头占 32 列。
+        config = SimpleNamespace(dtype=torch.float32, hidden_size=32, num_attention_heads=2,
+                                 num_key_value_heads=1)
+        layer = Attention(2, 32, 0.31, 2)
+        self.capacity = 3072  # 每页 2 个词元，2 个 KV 头，两份 FP32 张量，共 1024 字节。
+        runner = self.runner(layer, hf_config=config)
+        self.assertEqual(layer.k_cache.shape, (3, 2, 2, 32))
+        self.assertEqual(layer.v_cache.shape, layer.k_cache.shape)
+        self.assertEqual(runner.config.num_kvcache_blocks, 3)
+
+        rng = torch.Generator().manual_seed(17)
+        q = torch.randn(5, 2, 32, generator=rng)
+        k = torch.randn(5, 2, 32, generator=rng)
+        v = torch.randn(5, 2, 16, generator=rng)
+        scores = torch.einsum("thd,shd->hts", q.double(), k.double()) * 0.31
+        scores.masked_fill_(torch.ones(5, 5, dtype=torch.bool).triu(1), -torch.inf)
+        expected = torch.einsum("hts,shd->thd", scores.softmax(-1), v.double()).float()
+
+        seq = Sequence([0, 1, 2, 3])
+        seq.block_table = [2, 0]
+        for start, end in [(0, 2), (2, 4), (4, 5)]:
+            if start < 4:
+                seq.num_cached_tokens = start
+                seq.num_scheduled_tokens = end - start
+                runner.prepare_prefill([seq])
+            else:
+                seq.append_token(4)
+                seq.block_table.append(1)
+                runner.prepare_decode([seq])
+            padded_v = torch.nn.functional.pad(v[start:end], (0, 16))
+            out = layer(q[start:end], k[start:end], padded_v)
+            if start == 4:
+                out = out.squeeze(1)
+            torch.testing.assert_close(out[..., :16], expected[start:end], atol=2e-6, rtol=2e-5)
+            self.assertEqual(out[..., 16:].count_nonzero().item(), 0)
+        cached_k = layer.k_cache[seq.block_table].flatten(0, 1)[:5]
+        cached_v = layer.v_cache[seq.block_table].flatten(0, 1)[:5]
+        torch.testing.assert_close(cached_k, k)
+        torch.testing.assert_close(cached_v, torch.nn.functional.pad(v, (0, 16)))
+
+    def test_incompatible_kv_shapes_rejected_before_binding(self):
+        layers = nn.ModuleList([Attention(2, 32, 1, 2), Attention(2, 64, 1, 1)])
+        with self.assertRaisesRegex(ValueError, "KV"):
+            self.runner(layers)
+        self.assertTrue(all(layer.k_cache.numel() == 0 for layer in layers))
+
+    def test_legacy_cache_module_uses_config_geometry(self):
+        layer = nn.Module()
+        layer.k_cache = layer.v_cache = torch.empty(0)
+        self.capacity = 96
+        self.runner(layer)
+        self.assertEqual(layer.k_cache.shape, (2, 2, 1, 3))
+        self.assertEqual(layer.v_cache.shape, layer.k_cache.shape)
 
     def test_actual_kv_modules_and_state_bytes(self):
         layers = nn.ModuleList([History() for _ in range(10)] +

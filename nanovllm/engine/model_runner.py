@@ -156,8 +156,19 @@ class ModelRunner:
             config.num_kvcache_blocks = 0
             self.kv_cache = None
             return
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
+        cache_shapes = set()
+        for module in kv_modules:
+            # Attention 声明的是本 rank 实际写入的头数和头宽。
+            num_kv_heads = getattr(module, "num_kv_heads", None)
+            head_dim = getattr(module, "head_dim", None)
+            if num_kv_heads is None:
+                num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            if head_dim is None:
+                head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
+            cache_shapes.add((num_kv_heads, head_dim))
+        if len(cache_shapes) != 1:
+            raise ValueError(f"共享 KV 缓存要求各层的本地 KV 头数和头宽一致，实际为 {sorted(cache_shapes)}")
+        num_kv_heads, head_dim = cache_shapes.pop()
         block_bytes = 2 * len(kv_modules) * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         num_blocks = budget // block_bytes
         if self.world_size > 1:
