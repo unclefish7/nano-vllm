@@ -6,8 +6,11 @@ from torch import nn
 from safetensors import safe_open
 
 
-def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    param.data.copy_(loaded_weight)
+@torch.no_grad()
+def default_weight_loader(target: torch.Tensor, loaded_weight: torch.Tensor):
+    if target.shape != loaded_weight.shape:
+        raise ValueError(f"checkpoint 形状 {tuple(loaded_weight.shape)} 与目标形状 {tuple(target.shape)} 不符")
+    target.copy_(loaded_weight)
 
 
 def _find_packed_rule(weight_name: str, mapping: dict) -> str | None:
@@ -20,28 +23,26 @@ def _find_packed_rule(weight_name: str, mapping: dict) -> str | None:
     return hits[0] if hits else None
 
 
-def _get_parameter(model: nn.Module, name: str, weight_name: str, rule: str | None):
-    try:
-        return model.get_parameter(name)
-    except AttributeError:
-        if rule is not None:
-            hint = f"（packed_modules_mapping 规则 {rule!r} 把它映射到了 {name!r}）"
-        else:
-            hint = "（模型里没有这个参数；如果它确实用不上，把名字加进模型的 ignored_weight_keys）"
-        raise ValueError(f"checkpoint 里的 {weight_name!r} 找不到对应参数 {name!r}{hint}") from None
+def _loadable_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
+    tensors = dict(model.named_parameters(remove_duplicate=False))
+    for prefix, module in model.named_modules(remove_duplicate=False):
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
+            if name not in module._non_persistent_buffers_set:
+                tensors[f"{prefix}.{name}" if prefix else name] = buffer
+    return tensors
 
 
 def load_model(model: nn.Module, path: str):
     """把 checkpoint 装进模型，装完核对两边是否一一对上。
 
     三种关系：同名直接装；packed_modules_mapping 声明的多对一按 shard 装；
-    ignored_weight_keys 命中的直接跳过。装完要求模型的每个参数都被填过，
+    ignored_weight_keys 命中的直接跳过。装完要求每个参数和持久缓冲区都被填过，
     否则抛错并列出是谁——静默的随机初始化比报错难查得多。
     """
     mapping = getattr(model, "packed_modules_mapping", {})
     ignored = tuple(getattr(model, "ignored_weight_keys", ()))
-    expected = {name for name, _ in model.named_parameters()}
-    loaded: set[str] = set()
+    targets = _loadable_tensors(model)
+    loaded: set[int] = set()
     skipped: list[str] = []
 
     files = sorted(glob(os.path.join(path, "*.safetensors")))
@@ -56,26 +57,25 @@ def load_model(model: nn.Module, path: str):
                     continue
 
                 rule = _find_packed_rule(weight_name, mapping)
+                name = weight_name if rule is None else weight_name.replace(rule, mapping[rule][0])
+                if name not in targets:
+                    hint = f"（packed_modules_mapping 规则 {rule!r}）" if rule else ""
+                    raise ValueError(f"checkpoint 里的 {weight_name!r} 找不到对应参数或持久缓冲区 {name!r}{hint}")
+                tensor = targets[name]
                 if rule is None:
-                    param_name = weight_name
-                    param = _get_parameter(model, param_name, weight_name, None)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
+                    loader = getattr(tensor, "weight_loader", default_weight_loader)
+                    loader(tensor, f.get_tensor(weight_name))
                 else:
-                    target, shard_id = mapping[rule]
-                    param_name = weight_name.replace(rule, target)
-                    param = _get_parameter(model, param_name, weight_name, rule)
-                    weight_loader = getattr(param, "weight_loader")
-                    weight_loader(param, f.get_tensor(weight_name), shard_id)
-                loaded.add(param_name)
+                    tensor.weight_loader(tensor, f.get_tensor(weight_name), mapping[rule][1])
+                loaded.add(id(tensor))
 
-    missing = sorted(expected - loaded)
+    missing = sorted(name for name, tensor in targets.items() if id(tensor) not in loaded)
     if missing:
         preview = "、".join(missing[:10])
         if len(missing) > 10:
             preview += f" 等共 {len(missing)} 个"
         raise ValueError(
-            f"以下参数没有被 checkpoint 填充，会保持随机初始化：{preview}。"
+            f"以下参数或持久缓冲区没有被 checkpoint 填充：{preview}。"
             f"通常是 packed_modules_mapping 少了规则，或模型多写了 checkpoint 里没有的参数。"
         )
 

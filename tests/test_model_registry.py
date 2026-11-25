@@ -91,6 +91,31 @@ def _packed_weight_loader(param, loaded_weight, shard_id):
 
 
 class TestLoader(unittest.TestCase):
+    def test_checkpoint_loads_persistent_buffer_and_preserves_computed_cache(self):
+        model = nn.Module()
+        model.layer = nn.Module()
+        model.layer.register_buffer("scale", torch.tensor([1., 1.]))
+        model.layer.register_buffer("lookup", torch.tensor([9]), persistent=False)
+        self._save({"layer.scale": torch.tensor([2., 3.])})
+        stats = load_model(model, self.tmp)
+        self.assertEqual(stats["loaded"], 1)
+        self.assertEqual(model.layer.scale.tolist(), [2., 3.])
+        self.assertEqual(model.layer.lookup.tolist(), [9])
+        self._save({"layer.lookup": torch.tensor([10])})
+        with self.assertRaisesRegex(ValueError, "layer.lookup"):
+            load_model(model, self.tmp)
+
+    def test_missing_persistent_buffer_and_incorrect_shape_are_reported(self):
+        model = _TinyModel()
+        model.register_buffer("scale", torch.ones(2))
+        weights = {"a": torch.zeros_like(model.a), "b": torch.zeros_like(model.b)}
+        self._save(weights)
+        with self.assertRaisesRegex(ValueError, "scale"):
+            load_model(model, self.tmp)
+        self._save({**weights, "scale": torch.ones(1)})
+        with self.assertRaisesRegex(ValueError, "shape|形状"):
+            load_model(model, self.tmp)
+
 
     def setUp(self):
         # 用系统临时目录（可用 TMPDIR 改写）；容器里源码目录是只读挂载，不能就地建目录。
