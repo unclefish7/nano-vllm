@@ -3,12 +3,14 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from nanovllm.models import ARCH, check_model_contract, resolve_model_class
+from nanovllm.models import ARCH, check_model_contract, register_candidate_file, resolve_model_class
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.utils.loader import load_model
 
@@ -36,6 +38,22 @@ class TestRegistry(unittest.TestCase):
     def test_empty_architectures(self):
         with self.assertRaises(ValueError):
             resolve_model_class(_Config([]))
+
+    def test_config_resolves_local_model_by_declared_name_and_contract(self):
+        source = """from torch import nn
+class Projector(nn.Module):
+    pass
+class ExampleLMHeadModel(nn.Module):
+    def forward(self, input_ids, positions): return input_ids
+    def compute_logits(self, hidden_states): return hidden_states
+"""
+        with tempfile.TemporaryDirectory() as directory, patch.dict(ARCH):
+            path = Path(directory) / "candidate.py"
+            path.write_text(source)
+            self.assertEqual(register_candidate_file(str(path)), "ExampleLMHeadModel")
+            cls = resolve_model_class(_Config(["ExampleLMHeadModel"]))
+            check_model_contract(cls)
+            self.assertNotIn("Projector", ARCH)
 
 
 class TestContract(unittest.TestCase):

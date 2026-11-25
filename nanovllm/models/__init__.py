@@ -20,7 +20,7 @@ ARCH: dict[str, type[nn.Module]] = {
 
 
 def register_candidate_file(path: str) -> str:
-    """把候选 .py 文件里定义的 *ForCausalLM 类登记进 ARCH，返回架构名。
+    """以本地模型类的名称登记候选，返回文件中第一个入口的名称。
 
     引擎用 spawn 起其他 rank，子进程会重新 import 本模块。只在父进程里改
     ARCH 是传不过去的，所以这里提供一个“从文件重放登记”的入口，
@@ -33,15 +33,20 @@ def register_candidate_file(path: str) -> str:
         raise ValueError(f"无法把 {path} 当成 Python 模块加载")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    names = []
     for attr, obj in vars(module).items():
         if (
             inspect.isclass(obj)
-            and attr.endswith("ForCausalLM")
             and obj.__module__ == module.__name__
+            and attr == obj.__qualname__
+            and issubclass(obj, nn.Module)
+            and callable(getattr(obj, "compute_logits", None))
         ):
             ARCH[attr] = obj
-            return attr
-    raise ValueError(f"{path} 里没有定义 *ForCausalLM 类")
+            names.append(attr)
+    if not names:
+        raise ValueError(f"{path} 里没有定义提供 compute_logits 的模型类")
+    return names[0]
 
 
 _candidate_file = os.environ.get("NANOVLLM_MODEL_FILE")
